@@ -3,7 +3,6 @@ package folder
 import (
 	"context"
 	"fmt"
-
 	"io/ioutil"
 	"strings"
 
@@ -12,12 +11,14 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	csye7374v1alpha1 "github.com/Ashutosh-Shukla/csye7374-operator/pkg/apis/csye7374/v1alpha1"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -111,6 +112,16 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		return reconcile.Result{}, err
 	}
 
+	existingSecret := &corev1.Secret{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Spec.UserSecret.Name, Namespace: instance.Namespace}, existingSecret)
+	if existingSecret.Name != "" && existingSecret.Name != instance.Spec.UserSecret.Name {
+		instance.Status.SetupComplete = false
+		err = r.client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	//Get Operator Secret from file to be mounted in dir /usr/local/etc/operator/
 	awsAccessKeyIDbyte, err := ioutil.ReadFile("/usr/local/etc/operator/aws_access_key_id")
 	if err != nil {
@@ -140,6 +151,48 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		return reconcile.Result{}, err
 	}
 	cfg := aws.NewConfig().WithRegion(region).WithCredentials(creds)
+	//Finalizer Setup
+
+	// Finalizers
+	// Determine if instance is under deletion
+	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is not being deleted, so if it does not have our finalizer,
+		// then lets add the finalizer and update the object. This is equivalent
+		// registering our finalizer.
+		if !ContainsString(instance.ObjectMeta.Finalizers, FolderFinalizerName) {
+			instance.ObjectMeta.Finalizers = append(instance.ObjectMeta.Finalizers, FolderFinalizerName)
+			if err := r.client.Update(context.Background(), instance); err != nil {
+				log.Error(err, "Reconcile Folder Failed: Unable to add finalizer "+
+					"to Folder object.",
+					"Name", request.Name, "Namespace", request.Namespace)
+				return reconcile.Result{}, err
+			}
+		}
+	} else {
+		// The object is being deleted
+		if ContainsString(instance.ObjectMeta.Finalizers, FolderFinalizerName) {
+			// our finalizer is present, so let's delete any external dependencies
+			if err := r.deleteExternalResources(instance, cfg, bucket); err != nil {
+				// if fail to delete the external dependency here, return with error
+				// so that it can be retried
+				log.Error(err, "Reconcile Folder failed: Unable to delete external "+
+					"resources for Folder object.",
+					"Name", request.Name, "Namespace", request.Namespace)
+				return reconcile.Result{}, err
+			}
+
+			// remove our finalizer from the list and update it.
+			instance.ObjectMeta.Finalizers = RemoveString(instance.ObjectMeta.Finalizers, FolderFinalizerName)
+			if err := r.client.Update(context.Background(), instance); err != nil {
+				log.Error(err, "Reconcile Folder failed: Unable to update Folder object.",
+					"Name", request.Name, "Namespace", request.Namespace)
+				return reconcile.Result{}, err
+			}
+		}
+		log.Info("Reconcile Folder Cr Successful.",
+			"Name", request.Name, "Namespace", request.Namespace)
+		return reconcile.Result{}, nil
+	}
 
 	//Create S3 Folder in bucket
 	err = createS3Folder(cfg, bucket, instance)
@@ -218,7 +271,214 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		}
 	}
 
+	// Check if this Secret already exists
+	foundSecret := &corev1.Secret{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Spec.UserSecret.Name, Namespace: instance.Namespace}, foundSecret)
+	if err != nil && errors.IsNotFound(err) {
+
+		//Create a new Secret definition using accesskey as data
+		newSecret := NewSecret(instance.Namespace, instance.Spec.UserSecret.Name, aws.StringValue(accessKey.AccessKeyId), aws.StringValue(accessKey.SecretAccessKey))
+
+		// Set Folder instance as the owner and controller
+		if err := controllerutil.SetControllerReference(instance, newSecret, r.scheme); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		//create secret
+		reqLogger.Info("Creating a new Secret", "secret.Namespace", newSecret.Namespace, "Secret.Name", newSecret.Name)
+		err = r.client.Create(context.TODO(), newSecret)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+	} else if err != nil {
+		return reconcile.Result{}, err
+	}
+	reqLogger.Info("Skip reconcile: Secret exists", "secret.Namespace", foundSecret.Namespace, "Secret.Name", foundSecret.Name)
+	//update status to complete
+	instance.Status.SetupComplete = true
+	err = r.client.Status().Update(context.TODO(), instance)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
 	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileFolder) deleteExternalResources(instance *csye7374v1alpha1.Folder, cfg *aws.Config, bucketname string) error {
+
+	//delete folder
+	err := deleteS3Folder(bucketname, instance.Spec.Username, cfg)
+	if err != nil {
+		return err
+	}
+
+	//find policy Arn
+	currentAwsUser, err := GetUserIdentity(cfg)
+	if err != nil {
+		return err
+	}
+	accountId := aws.StringValue(currentAwsUser.Account)
+	policyArn := "arn:aws:iam::" + accountId + ":policy/" + instance.Spec.Username + "bucketPolicy"
+
+	//Detach Policy
+	err = detachUserPolicy(policyArn, instance.Spec.Username, cfg)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			if aerr.Code() != iam.ErrCodeNoSuchEntityException {
+				return err
+			}
+		}
+
+	}
+
+	//delete Policy
+	err = deleteIamPolicy(policyArn, cfg)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			if aerr.Code() != iam.ErrCodeNoSuchEntityException {
+				return err
+			}
+		}
+	}
+
+	//deleteAccessKeys
+	accesskeyList := ListAwsAccessKey(cfg, instance.Spec.Username).AccessKeyMetadata
+	if len(accesskeyList) > 0 || accesskeyList != nil {
+		accessKeyId := accesskeyList[0].AccessKeyId
+		if !DeleteAwsAccessKey(cfg, aws.StringValue(accessKeyId), instance.Spec.Username) {
+			log.Error(err, "Error:  Deleting  AwsAcessKey")
+			return err
+		}
+	}
+
+	//delete iam user
+	err = deleteIamUser(instance.Spec.Username, cfg)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			if aerr.Code() != iam.ErrCodeNoSuchEntityException {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func deleteIamPolicy(arn string, cfg *aws.Config) error {
+	svc := iam.New(session.New(), cfg)
+	input := &iam.DeletePolicyInput{
+		PolicyArn: aws.String(arn),
+	}
+
+	_, err := svc.DeletePolicy(input)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func detachUserPolicy(arn string, username string, cfg *aws.Config) error {
+	svc := iam.New(session.New(), cfg)
+	input := &iam.DetachUserPolicyInput{
+		PolicyArn: aws.String(arn),
+		UserName:  aws.String(username),
+	}
+
+	_, err := svc.DetachUserPolicy(input)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func deleteIamUser(username string, cfg *aws.Config) error {
+	svc := iam.New(session.New(), cfg)
+	input := &iam.DeleteUserInput{
+		UserName: aws.String(username),
+	}
+
+	_, err := svc.DeleteUser(input)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func deleteS3Folder(bucketname string, folderName string, cfg *aws.Config) error {
+	svc := s3.New(session.New(), cfg)
+	input := &s3.DeleteObjectInput{
+		Bucket: aws.String(bucketname),
+		Key:    aws.String(folderName + "/"),
+	}
+
+	listInput := &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketname),
+		Prefix: aws.String(folderName + "/"),
+	}
+
+	result, err := svc.ListObjectsV2(listInput)
+	if err != nil {
+		return err
+	}
+
+	if len(result.Contents) > 0 {
+		for _, obj := range result.Contents {
+			objinput := &s3.DeleteObjectInput{
+				Bucket: aws.String(bucketname),
+				Key:    obj.Key,
+			}
+			_, err = svc.DeleteObject(objinput)
+			if err != nil {
+				log.Error(err, "Cannot delete objects inside folder %s", aws.StringValue(obj.Key))
+				return err
+			}
+		}
+	}
+	_, err = svc.DeleteObject(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			default:
+				return err
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			return err
+		}
+		return err
+	}
+
+	return nil
+}
+
+func DeleteAwsAccessKey(cfg *aws.Config, accessKeyId string, username string) bool {
+
+	svc := iam.New(session.New(), cfg)
+	input := &iam.DeleteAccessKeyInput{
+		AccessKeyId: aws.String(accessKeyId),
+		UserName:    aws.String(username),
+	}
+
+	_, err := svc.DeleteAccessKey(input)
+	if err != nil {
+		return false
+	}
+	return true
+}
+
+// Helper function to remove string from a slice of strings.
+func RemoveString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }
 
 func GetUserIdentity(cfg *aws.Config) (*sts.GetCallerIdentityOutput, error) {
@@ -315,30 +575,30 @@ func CreateIamPolicy(cfg *aws.Config, bucket string, folderName string, accountI
  "Version":"2012-10-17",
  "Statement": [
    {
-	 "Sid": "AllowStatement1",
-	 "Action": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
-	 "Effect": "Allow",
-	 "Resource": ["arn:aws:s3:::*"]
+     "Sid": "AllowStatement1",
+     "Action": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
+     "Effect": "Allow",
+     "Resource": ["arn:aws:s3:::*"]
    },
   {
-	 "Sid": "AllowStatement2B",
-	 "Action": ["s3:ListBucket"],
-	 "Effect": "Allow",
-	 "Resource": ["arn:aws:s3:::` + bucket + `"],
-	 "Condition":{"StringEquals":{"s3:prefix":["","` + folderName + `"],"s3:delimiter":["/"]}}
-	},
+     "Sid": "AllowStatement2B",
+     "Action": ["s3:ListBucket"],
+     "Effect": "Allow",
+     "Resource": ["arn:aws:s3:::` + bucket + `"],
+     "Condition":{"StringEquals":{"s3:prefix":["","` + folderName + `"],"s3:delimiter":["/"]}}
+    },
   {
-	 "Sid": "AllowStatement3",
-	 "Action": ["s3:ListBucket"],
-	 "Effect": "Allow",
-	 "Resource": ["arn:aws:s3:::` + bucket + `"],
-	 "Condition":{"StringLike":{"s3:prefix":["` + folderName + `/*"]}}
-	},
+     "Sid": "AllowStatement3",
+     "Action": ["s3:ListBucket"],
+     "Effect": "Allow",
+     "Resource": ["arn:aws:s3:::` + bucket + `"],
+     "Condition":{"StringLike":{"s3:prefix":["` + folderName + `/*"]}}
+    },
    {
-	 "Sid": "AllowStatement4B",
-	 "Effect": "Allow",
-	 "Action": ["s3:*"],
-	 "Resource": ["arn:aws:s3:::` + bucket + `/` + folderName + `/*"]
+     "Sid": "AllowStatement4B",
+     "Effect": "Allow",
+     "Action": ["s3:*"],
+     "Resource": ["arn:aws:s3:::` + bucket + `/` + folderName + `/*"]
    }
  ]
 }`
@@ -400,6 +660,28 @@ func CreateAccessKeyForUser(cfg *aws.Config, username string) (*iam.AccessKey, e
 	}
 
 	return result.AccessKey, nil
+}
+
+// newPodForCR returns a busybox pod with the same name/namespace as the cr
+func NewSecret(namespace string, name string, awsAccesKeyId string, awsSecretAccessKey string) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String()},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"aws_access_key_id":     []byte(awsAccesKeyId),
+			"aws_secret_access_key": []byte(awsSecretAccessKey),
+		},
+	}
+}
+
+func GetSecret(thisClient client.Client, namespace string, name string) (*corev1.Secret, error) {
+	var secret = &corev1.Secret{}
+	err := thisClient.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: name}, secret)
+	return secret, err
 }
 
 // Helper function to check string from a slice of strings.
