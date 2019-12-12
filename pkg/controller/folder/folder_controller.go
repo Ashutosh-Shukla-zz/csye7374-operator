@@ -3,21 +3,21 @@ package folder
 import (
 	"context"
 	"fmt"
-
-	"io/ioutil"
-	"strings"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"io/ioutil"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"strings"
 
 	csye7374v1alpha1 "github.com/Ashutosh-Shukla/csye7374-operator/pkg/apis/csye7374/v1alpha1"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/s3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,6 +55,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
+
 	err = c.Watch(&source.Kind{Type: &csye7374v1alpha1.Folder{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
@@ -84,8 +85,7 @@ type ReconcileFolder struct {
 	scheme *runtime.Scheme
 }
 
-const FolderFinalizerName = "finalizer.csye7374.com"
-
+const FolderFinalizerName  = "finalizer.csye7374.com"
 // Reconcile reads that state of the cluster for a Folder object and makes changes based on the state read
 // and what is in the Folder.Spec
 // TODO(user): Modify this Reconcile function to implement your Controller logic.  This example creates
@@ -111,27 +111,37 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		return reconcile.Result{}, err
 	}
 
+	existingSecret := &corev1.Secret{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Spec.UserSecret.Name, Namespace: instance.Namespace}, existingSecret)
+	if existingSecret.Name!="" && existingSecret.Name != instance.Spec.UserSecret.Name {
+		instance.Status.SetupComplete = false
+		err = r.client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	//Get Operator Secret from file to be mounted in dir /usr/local/etc/operator/
 	awsAccessKeyIDbyte, err := ioutil.ReadFile("/usr/local/etc/operator/aws_access_key_id")
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	awsAccessKeyID := strings.TrimRight(string(awsAccessKeyIDbyte), "\r\n")
-	awsSecretAccessKeybyte, err := ioutil.ReadFile("/usr/local/etc/operator/aws_secret_access_key")
+	awsAccessKeyID := strings.TrimRight(string(awsAccessKeyIDbyte),  "\r\n")
+	awsSecretAccessKeybyte,err := ioutil.ReadFile("/usr/local/etc/operator/aws_secret_access_key")
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	awsSecretAccessKey := strings.TrimRight(string(awsSecretAccessKeybyte), "\r\n")
-	bucketbyte, err := ioutil.ReadFile("/usr/local/etc/operator/bucketname")
+	awsSecretAccessKey:= strings.TrimRight(string(awsSecretAccessKeybyte),  "\r\n")
+	bucketbyte,err := ioutil.ReadFile("/usr/local/etc/operator/bucketname")
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	bucket := strings.TrimRight(string(bucketbyte), "\r\n")
-	regionbyte, err := ioutil.ReadFile("/usr/local/etc/operator/aws_region")
+	bucket:=strings.TrimRight(string(bucketbyte),  "\r\n")
+	regionbyte,err := ioutil.ReadFile("/usr/local/etc/operator/aws_region")
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	region := strings.TrimRight(string(regionbyte), "\r\n")
+	region:=strings.TrimRight(string(regionbyte),  "\r\n")
 	token := ""
 	creds := credentials.NewStaticCredentials(awsAccessKeyID, awsSecretAccessKey, token)
 
@@ -175,7 +185,7 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 	accesskeyList := ListAwsAccessKey(cfg, aws.StringValue(createdAwsUser.UserName)).AccessKeyMetadata
 
 	var accessKey *iam.AccessKey
-	if len(accesskeyList) < 1 || accesskeyList == nil {
+	if  len(accesskeyList) < 1 || accesskeyList == nil  {
 		accessKey, err = CreateAccessKeyForUser(cfg, aws.StringValue(createdAwsUser.UserName))
 		if err != nil {
 			return reconcile.Result{}, err
@@ -206,11 +216,11 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 				if err != nil {
 					return reconcile.Result{}, err
 				}
-				if foundSecret.Name != "" {
-					err = r.client.Delete(context.TODO(), foundSecret)
-					if err != nil {
-						return reconcile.Result{}, err
-					}
+				if foundSecret.Name!=""{
+				err = r.client.Delete(context.TODO(), foundSecret)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
 				}
 			} else {
 				return reconcile.Result{}, err
@@ -218,7 +228,52 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		}
 	}
 
+
+
+	// Check if this Secret already exists
+	foundSecret := &corev1.Secret{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: instance.Spec.UserSecret.Name, Namespace: instance.Namespace}, foundSecret)
+	if err != nil && errors.IsNotFound(err) {
+
+		//Create a new Secret definition using accesskey as data
+		newSecret := NewSecret(instance.Namespace, instance.Spec.UserSecret.Name, aws.StringValue(accessKey.AccessKeyId), aws.StringValue(accessKey.SecretAccessKey))
+
+		// Set Folder instance as the owner and controller
+		if err := controllerutil.SetControllerReference(instance, newSecret, r.scheme); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		//create secret
+		reqLogger.Info("Creating a new Secret", "secret.Namespace", newSecret.Namespace, "Secret.Name", newSecret.Name)
+		err = r.client.Create(context.TODO(), newSecret)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+	} else if err != nil {
+		return reconcile.Result{}, err
+	}
+	reqLogger.Info("Skip reconcile: Secret exists", "secret.Namespace", foundSecret.Namespace, "Secret.Name", foundSecret.Name)
+	//update status to complete
+	instance.Status.SetupComplete = true
+	err = r.client.Status().Update(context.TODO(), instance)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
 	return reconcile.Result{}, nil
+}
+
+
+// Helper function to remove string from a slice of strings.
+func RemoveString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }
 
 func GetUserIdentity(cfg *aws.Config) (*sts.GetCallerIdentityOutput, error) {
@@ -315,30 +370,30 @@ func CreateIamPolicy(cfg *aws.Config, bucket string, folderName string, accountI
  "Version":"2012-10-17",
  "Statement": [
    {
-	 "Sid": "AllowStatement1",
-	 "Action": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
-	 "Effect": "Allow",
-	 "Resource": ["arn:aws:s3:::*"]
+     "Sid": "AllowStatement1",
+     "Action": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
+     "Effect": "Allow",
+     "Resource": ["arn:aws:s3:::*"]
    },
   {
-	 "Sid": "AllowStatement2B",
-	 "Action": ["s3:ListBucket"],
-	 "Effect": "Allow",
-	 "Resource": ["arn:aws:s3:::` + bucket + `"],
-	 "Condition":{"StringEquals":{"s3:prefix":["","` + folderName + `"],"s3:delimiter":["/"]}}
-	},
+     "Sid": "AllowStatement2B",
+     "Action": ["s3:ListBucket"],
+     "Effect": "Allow",
+     "Resource": ["arn:aws:s3:::` + bucket + `"],
+     "Condition":{"StringEquals":{"s3:prefix":["","` + folderName + `"],"s3:delimiter":["/"]}}
+    },
   {
-	 "Sid": "AllowStatement3",
-	 "Action": ["s3:ListBucket"],
-	 "Effect": "Allow",
-	 "Resource": ["arn:aws:s3:::` + bucket + `"],
-	 "Condition":{"StringLike":{"s3:prefix":["` + folderName + `/*"]}}
-	},
+     "Sid": "AllowStatement3",
+     "Action": ["s3:ListBucket"],
+     "Effect": "Allow",
+     "Resource": ["arn:aws:s3:::` + bucket + `"],
+     "Condition":{"StringLike":{"s3:prefix":["` + folderName + `/*"]}}
+    },
    {
-	 "Sid": "AllowStatement4B",
-	 "Effect": "Allow",
-	 "Action": ["s3:*"],
-	 "Resource": ["arn:aws:s3:::` + bucket + `/` + folderName + `/*"]
+     "Sid": "AllowStatement4B",
+     "Effect": "Allow",
+     "Action": ["s3:*"],
+     "Resource": ["arn:aws:s3:::` + bucket + `/` + folderName + `/*"]
    }
  ]
 }`
@@ -388,6 +443,7 @@ func ListAwsAccessKey(cfg *aws.Config, username string) *iam.ListAccessKeysOutpu
 	return result
 }
 
+
 func CreateAccessKeyForUser(cfg *aws.Config, username string) (*iam.AccessKey, error) {
 	svc := iam.New(session.New(), cfg)
 
@@ -402,6 +458,29 @@ func CreateAccessKeyForUser(cfg *aws.Config, username string) (*iam.AccessKey, e
 	return result.AccessKey, nil
 }
 
+// newPodForCR returns a busybox pod with the same name/namespace as the cr
+func NewSecret(namespace string, name string, awsAccesKeyId string, awsSecretAccessKey string) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String()},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"aws_access_key_id":     []byte(awsAccesKeyId),
+			"aws_secret_access_key": []byte(awsSecretAccessKey),
+		},
+	}
+}
+
+
+func GetSecret(thisClient client.Client, namespace string, name string) (*corev1.Secret, error) {
+	var secret = &corev1.Secret{}
+	err := thisClient.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: name}, secret)
+	return secret, err
+}
+
 // Helper function to check string from a slice of strings.
 func ContainsString(slice []string, s string) bool {
 	for _, item := range slice {
@@ -411,3 +490,4 @@ func ContainsString(slice []string, s string) bool {
 	}
 	return false
 }
+
