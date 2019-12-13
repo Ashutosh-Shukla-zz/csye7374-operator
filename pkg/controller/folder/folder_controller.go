@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -294,7 +295,7 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 	} else if err != nil {
 		return reconcile.Result{}, err
 	}
-	reqLogger.Info("Skip reconcile: Secret exists", "secret.Namespace", foundSecret.Namespace, "Secret.Name", foundSecret.Name)
+	reqLogger.Info("Reconciling done", "secret.Namespace", foundSecret.Namespace, "Secret.Name", foundSecret.Name)
 	//update status to complete
 	instance.Status.SetupComplete = true
 	err = r.client.Status().Update(context.TODO(), instance)
@@ -302,7 +303,7 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		return reconcile.Result{}, err
 	}
 
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: time.Second * 5}, nil
 }
 
 func (r *ReconcileFolder) deleteExternalResources(instance *csye7374v1alpha1.Folder, cfg *aws.Config, bucketname string) error {
@@ -502,7 +503,6 @@ func GetUserIdentity(cfg *aws.Config) (*sts.GetCallerIdentityOutput, error) {
 		}
 	}
 
-	fmt.Println(result)
 	return result, nil
 }
 
