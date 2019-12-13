@@ -11,17 +11,10 @@ A Kubernetes operator to create s3 folders
 | Lakshit Talreja|001475200 |talreja.l@husky.neu.edu |
 
 To create instances of this custom operator:
-1)Install this operator using helm chart using the following command:
-```sh
-helm install . --namespace operator-demo \
---name csye7374-operator-helm-chart \
---set aws.accessKeyId=AWS_ACCESS_KEY \
---set aws.secretAccessKey=AWS_SECRET_KEY \
---set aws.bucketName=BUCKET_NAME_WHERE_FOLDER_IS_CREATED \
---set aws.region=AWS_REGION \
---set image.repository=DOCKER_IMAGE \
---set imageCredentials.username=DOCKER_USERNAME \
---set imageCredentials.password=DOCKER_PASSWORD 
+
+1)Install this operator using helm chart from the following link:
+```
+https://github.com/mitali-salvi/csye7374-operator-helm-chart 
 ```
 2)Create instance of the custom operator. Sample CR
 ```
