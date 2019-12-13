@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csye7374-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: csye7374-operator
+  template:
+    metadata:
+      labels:
+        name: csye7374-operator
+    spec:
+      serviceAccountName: csye7374-operator-service-account
+      containers:
+        - name: csye7374-operator
+          image: mitalisalvi/csye7374-operator:latest
+          command:
+          - csye7374-operator
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: secret-volume
+              mountPath: /usr/local/etc/operator
+          env:
+            - name: WATCH_NAMESPACE
+              value: ""
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPERATOR_NAME
+              value: csye7374-operator       
+      imagePullSecrets:
+        - name: csye7374-operator-docker-secret
+      volumes:
+        - name: secret-volume
+          secret:
+            secretName: csye7374-operator-secret

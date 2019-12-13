@@ -1,0 +1,12 @@
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csye7374-operator-cluster-role-binding
+subjects:
+- kind: ServiceAccount
+  name: csye7374-operator-service-account
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: csye7374-operator-cluster-role
+  apiGroup: rbac.authorization.k8s.io
