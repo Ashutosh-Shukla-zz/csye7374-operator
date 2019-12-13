@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -302,7 +303,7 @@ func (r *ReconcileFolder) Reconcile(request reconcile.Request) (reconcile.Result
 		return reconcile.Result{}, err
 	}
 
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: time.Second * 60}, nil
 }
 
 func (r *ReconcileFolder) deleteExternalResources(instance *csye7374v1alpha1.Folder, cfg *aws.Config, bucketname string) error {
